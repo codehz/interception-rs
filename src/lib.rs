@@ -4,14 +4,18 @@ pub extern crate interception_sys;
 extern crate bitflags;
 
 pub use interception_sys as raw;
+pub mod bounded_slice;
 pub mod scancode;
 
+pub use bounded_slice::{BoundedSlice, BoundedSliceSource};
 pub use scancode::ScanCode;
 
+use std::char::decode_utf16;
 use std::convert::{TryFrom, TryInto};
 use std::default::Default;
+use std::mem::MaybeUninit;
+use std::ops::{Index, IndexMut};
 use std::time::Duration;
-use std::vec::Vec;
 
 pub type Device = i32;
 pub type Precedence = i32;
@@ -207,6 +211,22 @@ impl TryFrom<Stroke> for raw::InterceptionKeyStroke {
 
 pub struct Interception {
     ctx: raw::InterceptionContext,
+    text_buffer: [u16; 512],
+}
+
+pub trait InterceptionBuffer<const BUFFER_SIZE: usize>
+where
+    Self: Index<usize, Output = Stroke>,
+    Self: IndexMut<usize>,
+    Self: BoundedSliceSource<Stroke, BUFFER_SIZE>,
+{
+    fn new() -> Self;
+}
+
+impl<const BUFFER_SIZE: usize> InterceptionBuffer<BUFFER_SIZE> for [Stroke; BUFFER_SIZE] {
+    fn new() -> Self {
+        unsafe { MaybeUninit::uninit().assume_init() }
+    }
 }
 
 impl Interception {
@@ -217,7 +237,10 @@ impl Interception {
             return None;
         }
 
-        Some(Interception { ctx: ctx })
+        Some(Interception {
+            ctx,
+            text_buffer: [0; 512],
+        })
     }
 
     pub fn get_precedence(&self, device: Device) -> Precedence {
@@ -251,12 +274,15 @@ impl Interception {
         }
     }
 
-    pub fn set_filter(&self, predicate: Predicate, filter: Filter) {
-        let filter = match filter {
-            Filter::MouseFilter(filter) => filter.bits(),
-            Filter::KeyFilter(filter) => filter.bits(),
+    pub fn set_filter(&self, filter: Filter) {
+        let (predicate, filter): (Predicate, u16) = match filter {
+            Filter::MouseFilter(filter) => (is_mouse, filter.bits()),
+            Filter::KeyFilter(filter) => (is_keyboard, filter.bits()),
         };
+        self.set_filter_internal(predicate, filter)
+    }
 
+    fn set_filter_internal(&self, predicate: Predicate, filter: u16) {
         unsafe {
             let predicate = std::mem::transmute(Some(predicate));
             raw::interception_set_filter(self.ctx, predicate, filter)
@@ -276,53 +302,74 @@ impl Interception {
         unsafe { raw::interception_wait_with_timeout(self.ctx, millis) }
     }
 
-    pub fn send(&self, device: Device, strokes: &[Stroke]) -> i32 {
-        if is_mouse(device) {
-            self.send_internal::<raw::InterceptionMouseStroke>(device, strokes)
-        } else if is_keyboard(device) {
-            self.send_internal::<raw::InterceptionKeyStroke>(device, strokes)
-        } else {
-            0
-        }
-    }
-
-    fn send_internal<T: TryFrom<Stroke>>(&self, device: Device, strokes: &[Stroke]) -> i32 {
-        let mut raw_strokes = Vec::new();
-
-        for stroke in strokes {
-            if let Ok(raw_stroke) = T::try_from(*stroke) {
-                raw_strokes.push(raw_stroke)
-            }
-        }
-
-        let ptr = raw_strokes.as_ptr();
-        let len = match u32::try_from(raw_strokes.len()) {
-            Ok(l) => l,
-            Err(_) => u32::MAX,
-        };
-
-        unsafe { raw::interception_send(self.ctx, device, std::mem::transmute(ptr), len) }
-    }
-
-    pub fn receive(&self, device: Device, strokes: &mut [Stroke]) -> i32 {
-        if is_mouse(device) {
-            self.receive_internal::<raw::InterceptionMouseStroke>(device, strokes)
-        } else if is_keyboard(device) {
-            self.receive_internal::<raw::InterceptionKeyStroke>(device, strokes)
-        } else {
-            0
-        }
-    }
-
-    fn receive_internal<T: TryInto<Stroke> + Default + Copy>(
+    pub fn send<const BUFFER_SIZE: usize>(
         &self,
         device: Device,
-        strokes: &mut [Stroke],
+        strokes: &BoundedSlice<Stroke, BUFFER_SIZE>,
     ) -> i32 {
-        let mut raw_strokes: Vec<T> = Vec::with_capacity(strokes.len());
-        raw_strokes.resize_with(strokes.len(), Default::default);
+        if is_mouse(device) {
+            self.send_internal::<raw::InterceptionMouseStroke, BUFFER_SIZE>(device, strokes)
+        } else if is_keyboard(device) {
+            self.send_internal::<raw::InterceptionKeyStroke, BUFFER_SIZE>(device, strokes)
+        } else {
+            0
+        }
+    }
 
+    fn send_internal<T: TryFrom<Stroke>, const BUFFER_SIZE: usize>(
+        &self,
+        device: Device,
+        strokes: &BoundedSlice<Stroke, BUFFER_SIZE>,
+    ) -> i32 {
+        let mut raw_strokes: [T; BUFFER_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
+        let mut len = 0usize;
+        for stroke in strokes.into_iter() {
+            if let Ok(raw_stroke) = T::try_from(*stroke) {
+                raw_strokes[len] = raw_stroke;
+                len += 1;
+            }
+        }
+        let raw_strokes = raw_strokes.get_prefix(len);
         let ptr = raw_strokes.as_ptr();
+        unsafe { raw::interception_send(self.ctx, device, std::mem::transmute(ptr), len as u32) }
+    }
+
+    pub fn receive<
+        's,
+        'buffer,
+        Buffer: InterceptionBuffer<BUFFER_SIZE>,
+        const BUFFER_SIZE: usize,
+    >(
+        &'s self,
+        device: Device,
+        buffer: &'buffer mut Buffer,
+    ) -> &'buffer BoundedSlice<Stroke, BUFFER_SIZE> {
+        let len = if is_mouse(device) {
+            self.receive_internal::<raw::InterceptionMouseStroke, Buffer, BUFFER_SIZE>(
+                device, buffer,
+            )
+        } else if is_keyboard(device) {
+            self.receive_internal::<raw::InterceptionKeyStroke, Buffer, BUFFER_SIZE>(device, buffer)
+        } else {
+            0
+        };
+        buffer.get_prefix(len)
+    }
+
+    fn receive_internal<
+        's,
+        'buffer,
+        T: TryInto<Stroke> + Default + Copy,
+        Buffer: InterceptionBuffer<BUFFER_SIZE>,
+        const BUFFER_SIZE: usize,
+    >(
+        &self,
+        device: Device,
+        buffer: &'buffer mut Buffer,
+    ) -> usize {
+        let mut raw_strokes: [T; BUFFER_SIZE] = unsafe { MaybeUninit::uninit().assume_init() };
+
+        let ptr = raw_strokes.as_mut_ptr();
         let len = match u32::try_from(raw_strokes.len()) {
             Ok(l) => l,
             Err(_) => u32::MAX,
@@ -331,10 +378,10 @@ impl Interception {
         let num_read =
             unsafe { raw::interception_receive(self.ctx, device, std::mem::transmute(ptr), len) };
 
-        let mut num_valid: i32 = 0;
+        let mut num_valid: usize = 0;
         for i in 0..num_read {
             if let Ok(stroke) = raw_strokes[i as usize].try_into() {
-                strokes[num_valid as usize] = stroke;
+                buffer[num_valid as usize] = stroke;
                 num_valid += 1;
             }
         }
@@ -342,16 +389,20 @@ impl Interception {
         num_valid
     }
 
-    pub fn get_hardware_id(&self, device: Device, buffer: &mut [u8]) -> u32 {
-        let ptr = buffer.as_mut_ptr();
-        let len = match u32::try_from(buffer.len()) {
-            Ok(l) => l,
-            Err(_) => u32::MAX,
-        };
-
-        unsafe {
-            raw::interception_get_hardware_id(self.ctx, device, std::mem::transmute(ptr), len)
+    pub fn get_hardware_id(&mut self, device: Device) -> Option<String> {
+        let ptr = self.text_buffer.as_mut_ptr();
+        let len = unsafe {
+            raw::interception_get_hardware_id(self.ctx, device, std::mem::transmute(ptr), 1024)
+        } as usize;
+        if len == 0 {
+            return None;
         }
+        let u16str = &self.text_buffer[..(len / 2)];
+        Some(
+            decode_utf16(u16str.iter().cloned())
+                .map(|r| r.unwrap_or('�'))
+                .collect(),
+        )
     }
 }
 
